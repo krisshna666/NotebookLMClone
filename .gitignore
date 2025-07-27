@@ -1,0 +1,14 @@
+# Ignore node_modules folder
+node_modules/
+
+# Ignore npm cache
+.npm/
+
+# Ignore yarn cache (if you use yarn)
+.yarn/
+
+# Ignore package-lock.json (optional, but sometimes used)
+package-lock.json
+
+# Ignore npm-debug.log (optional, if you want to ignore npm logs)
+npm-debug.log
