@@ -10,6 +10,7 @@ const { OpenAI } = require('openai');
 const app = express();
 const port = process.env.PORT || 3000;
 const upload = multer({ dest: 'uploads/' });
+
 const openai = new OpenAI({
     apiKey: process.env.api_key
 });
@@ -17,12 +18,14 @@ const openai = new OpenAI({
 app.use(cors());
 app.use(express.json());
 
-const CACHE_DIR = path.join(__dirname, 'cache');
-fs.ensureDirSync(CACHE_DIR);
-
 let latestFileId = null;
+let latestPdfText = null;
 const processingStatus = new Map();
 
+//THIS ARRAY IS FOR MAINTAINING PREVIOUS RESPONSES AS WELL------> SRI
+let chatHistory = [];
+
+// CHUNKING TEXT FROM PDF --->SRI
 function chunkText(text, maxWords = 300) {
     const words = text.split(/\s+/);
     const chunks = [];
@@ -32,6 +35,7 @@ function chunkText(text, maxWords = 300) {
     return chunks;
 }
 
+//THIS METHOD IS FOR CALCULATING THE CLOSENESS BETWEEN TWO VECTORS ---->SRI
 function cosineSimilarity(a, b) {
     const dot = a.reduce((sum, val, i) => sum + val * b[i], 0);
     const normA = Math.sqrt(a.reduce((sum, val) => sum + val ** 2, 0));
@@ -39,6 +43,7 @@ function cosineSimilarity(a, b) {
     return normA && normB ? dot / (normA * normB) : 0;
 }
 
+// GETTING THE VECTOR EMBEDDINGS OF THE CHUNKS VIA OPENAI  ---->SRI
 async function getEmbeddings(texts) {
     const res = await openai.embeddings.create({
         model: 'text-embedding-ada-002',
@@ -47,33 +52,24 @@ async function getEmbeddings(texts) {
     return res.data.map(obj => obj.embedding);
 }
 
+//STORING THE UPLOADED PDF IN MEMORY -----> SRI
 async function processPdf(fileId, filePath) {
     try {
         processingStatus.set(fileId, 'processing');
         const buffer = await fs.readFile(filePath);
         const parsed = await pdfParse(buffer);
-
-        const textChunks = chunkText(parsed.text);
-        const embeddings = await getEmbeddings(textChunks);
-
-        const results = textChunks.map((text, idx) => ({
-            text,
-            embedding: embeddings[idx],
-        }));
-
-        const cacheFile = path.join(CACHE_DIR, `${fileId}.json`);
-        await fs.writeJSON(cacheFile, results);
-
-        processingStatus.set(fileId, 'ready');
+        latestPdfText = parsed.text;
         latestFileId = fileId;
-
+        processingStatus.set(fileId, 'ready');
         await fs.unlink(filePath);
     } catch (err) {
         processingStatus.set(fileId, 'failed');
+        console.error('Error processing PDF:', err);
     }
 }
 
-app.post('/upload', upload.single('pdf'), async (req, res) => {
+//THIS METHOD IS FOR BREAKING THE UPLOADED PDF TO CHUNKS ---->SRI
+app.post('/upload-and-parse', upload.single('pdf'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded' });
     }
@@ -81,26 +77,12 @@ app.post('/upload', upload.single('pdf'), async (req, res) => {
     const fileId = req.file.filename;
     latestFileId = fileId;
     const filePath = req.file.path;
-
     res.json({ message: 'File received, processing in background' });
-
-    const cacheFile = path.join(CACHE_DIR, `${fileId}.json`);
-    if (await fs.pathExists(cacheFile)) {
-        processingStatus.set(fileId, 'ready');
-        latestFileId = fileId;
-        await fs.unlink(filePath);
-        return;
-    }
-
     processPdf(fileId, filePath);
 });
 
-app.get('/status', (_, res) => {
-    if (!latestFileId) return res.json({ status: 'no_file_uploaded' });
-    const status = processingStatus.get(latestFileId) || 'not_found';
-    res.json({ status });
-});
 
+//THIS METHOD IS FOR SENDING PROMPTS TO THE GPT TO GET APT RESPONSES BASED ON THE UPLOADED PDF
 app.post('/ask', async (req, res) => {
     const { question } = req.body;
 
@@ -108,20 +90,15 @@ app.post('/ask', async (req, res) => {
         return res.status(400).json({ error: 'Missing or invalid "question" in request body' });
     }
 
-    if (!latestFileId) {
-        return res.status(400).json({ error: 'No PDF has been uploaded yet' });
-    }
-
-    const cacheFile = path.join(CACHE_DIR, `${latestFileId}.json`);
-    if (!(await fs.pathExists(cacheFile))) {
-        return res.status(400).json({ error: 'PDF is still processing or failed' });
+    if (!latestPdfText) {
+        return res.status(400).json({ error: 'No PDF has been uploaded or processed yet' });
     }
 
     try {
-        const chunks = await fs.readJSON(cacheFile);
-        if (!Array.isArray(chunks) || chunks.length === 0) {
-            return res.status(500).json({ error: 'No content found in the processed PDF' });
-        }
+        chatHistory.push({ role: 'user', content: question });
+
+        const textChunks = chunkText(latestPdfText);
+        const embeddings = await getEmbeddings(textChunks);
 
         const embedRes = await openai.embeddings.create({
             model: 'text-embedding-ada-002',
@@ -130,9 +107,9 @@ app.post('/ask', async (req, res) => {
 
         const questionEmbedding = embedRes.data[0].embedding;
 
-        const scored = chunks.map(({ text, embedding }) => ({
+        const scored = textChunks.map((text, idx) => ({
             text,
-            score: cosineSimilarity(questionEmbedding, embedding),
+            score: cosineSimilarity(questionEmbedding, embeddings[idx]),
         }));
 
         const topChunks = scored
@@ -142,8 +119,8 @@ app.post('/ask', async (req, res) => {
             .join('\n\n');
 
         const prompt = `
-Use the context below to answer the question clearly and concisely.
-
+Use the context below to answer the question clearly and concisely. Also remember the previous questions by the user and answer accordingly.
+Assume that this context comes from a document.
 Context:
 ${topChunks}
 
@@ -152,21 +129,27 @@ ${question}
 
 Answer:
 `.trim();
+        chatHistory.push({ role: 'system', content: prompt });
 
         const answerRes = await openai.chat.completions.create({
-            model: 'gpt-3.5-turbo',
-            messages: [{ role: 'user', content: prompt }],
+            model: 'gpt-4',
+            messages: chatHistory,
         });
 
         const answer = answerRes.choices[0].message.content;
+        chatHistory.push({ role: 'assistant', content: answer });
+
         res.json({ answer });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to generate answer' });
+        console.error('Error generating answer:', err);
+
+        res.status(500).json({ answer: 'Failed to generate answer', details: err.message });
     }
 });
 
 app.get('/', (_, res) => res.send('✅ PDF Q&A API is running'));
 
+// STARTING THE SERVER  ---->SRI
 app.listen(port, () => {
-    console.log('Server listening at the port');
+    console.log(`Server listening on port ${port}`);
 });
