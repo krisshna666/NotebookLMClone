@@ -4,7 +4,7 @@
   "main": "pdfClone.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start":"node --max-old-space-size=4096 pdfClone.js"
+    "start":"node --max-old-space-size=4096 index.js"
   },
   "author": "",
   "license": "ISC",
